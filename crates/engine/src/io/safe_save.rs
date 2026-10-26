@@ -50,6 +50,9 @@ impl Temporary {
         for _ in 0..128 {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = destination.with_file_name(format!(".wordcraft-save-{}-{id}.tmp", std::process::id()));
+            // Beside the destination, so in its folder: held to the automation write root like the
+            // destination (a destination naming the root itself would put it beside the root).
+            crate::file_access::check_write(&path.to_string_lossy()).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]

@@ -174,6 +174,29 @@ fn saves_and_exports_go_only_into_the_write_root() {
     assert!(!base.join("in/doc.docx").exists());
 }
 
+/// A save writes a temporary file beside its destination first. Saving to the write root itself
+/// (here a folder named like a document) would put that file beside the root, outside it: the
+/// save is refused before anything is written.
+#[test]
+fn a_save_to_the_write_root_itself_writes_nothing_beside_it() {
+    let base = std::env::temp_dir().join(format!("wc-mcp-roots-itself-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("book.docx");
+    std::fs::create_dir_all(&root).unwrap();
+    let roots = AutomationRoots::new(None, Some(root.as_path())).unwrap();
+    let mut server = Server::new(Box::new(Headless::default().with_automation_roots(roots)));
+    ok(&mut server, "type_text", json!({"text": "Hello"}));
+    let sep = std::path::MAIN_SEPARATOR;
+    refused(&mut server, "save_document", json!({"path": s(&root)}), "outside the write root");
+    let (error, text) = call(&mut server, "save_document", json!({"path": format!("{}{sep}.", s(&root))}));
+    assert!(error, "{text}");
+    ok(&mut server, "save_document", json!({"path": s(&root.join("inside.docx"))}));
+    let beside: Vec<String> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(beside, ["book.docx"], "nothing but the root beside it");
+    assert!(root.join("inside.docx").is_file());
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn a_root_left_out_grants_none_of_its_access() {
     let (mut server, base) = confined("read-only", true, false);
