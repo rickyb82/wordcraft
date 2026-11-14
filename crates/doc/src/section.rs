@@ -2,7 +2,36 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::props::{Borders, VAlign};
+use crate::props::Borders;
+
+/// How a section's text sits on its pages, top to bottom (`w:vAlign`, ECMA-376 §17.6.23,
+/// ST_VerticalJc). Table cells and text boxes use [`crate::props::VAlign`], which has no
+/// Justified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PageVAlign {
+    #[default]
+    Top,
+    Center,
+    /// Justified (`both`): the room left on each page is shared out equally between the page's
+    /// paragraphs and tables, so the text runs from the top margin to the bottom one.
+    #[serde(alias = "both", alias = "justified")]
+    Justify,
+    Bottom,
+}
+
+impl PageVAlign {
+    /// From a command or file value: `top|center|justify|bottom` (also `both`, `justified`,
+    /// `middle`); anything else is Top.
+    pub fn parse(v: &str) -> PageVAlign {
+        match v {
+            "center" | "middle" => PageVAlign::Center,
+            "justify" | "justified" | "both" => PageVAlign::Justify,
+            "bottom" => PageVAlign::Bottom,
+            _ => PageVAlign::Top,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +113,40 @@ pub enum NumFormat {
     ThaiCounting,
     BahtText,
     DollarText,
+}
+
+/// Chapter separator for page numbers (`w:chapSep`, ECMA-376 §17.18.12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChapterSep {
+    Hyphen,
+    Period,
+    Colon,
+    EmDash,
+    EnDash,
+}
+
+impl ChapterSep {
+    pub fn from_ooxml(value: &str) -> Option<Self> {
+        match value {
+            "hyphen" => Some(Self::Hyphen),
+            "period" => Some(Self::Period),
+            "colon" => Some(Self::Colon),
+            "emDash" => Some(Self::EmDash),
+            "enDash" => Some(Self::EnDash),
+            _ => None,
+        }
+    }
+
+    pub const fn ooxml(self) -> &'static str {
+        match self {
+            Self::Hyphen => "hyphen",
+            Self::Period => "period",
+            Self::Colon => "colon",
+            Self::EmDash => "emDash",
+            Self::EnDash => "enDash",
+        }
+    }
 }
 
 impl NumFormat {
@@ -226,17 +289,22 @@ impl NumFormat {
     pub fn from_ooxml(s: &str) -> NumFormat {
         NumFormat::ALL.into_iter().find(|f| f.ooxml() == s).unwrap_or(NumFormat::Decimal)
     }
-    /// Format `n` (1-based). Formats WordCraft doesn't draw yet (Hebrew, Arabic, Hindi, Thai,
-    /// Vietnamese, Russian, text amounts) show decimal, as do values past a sequence's end
-    /// (the 21st item of ①…⑳).
+    /// Format `n` (1-based). Formats WordCraft doesn't draw yet (Hebrew, Hindi, Thai letters
+    /// and counting, Vietnamese, text amounts) show decimal, as do values past a sequence's end
+    /// (the 21st item of ①…⑳). Thai numbers are the decimal number in Thai digits (๑, ๒ … ๑๐).
     pub fn format(self, n: u32) -> String {
         use crate::cjk_numbers as cjk;
         match self {
             NumFormat::DecimalZero => format!("{n:02}"),
+            NumFormat::ThaiNumbers => thai_digits(n),
             NumFormat::UpperRoman => roman(n).to_uppercase(),
             NumFormat::LowerRoman => roman(n),
             NumFormat::UpperLetter => letters(n).to_uppercase(),
             NumFormat::LowerLetter => letters(n),
+            NumFormat::RussianUpper => russian_letters(n).to_uppercase(),
+            NumFormat::RussianLower => russian_letters(n),
+            NumFormat::ArabicAlpha => repeated_letter(&ARABIC_ALPHA, n),
+            NumFormat::ArabicAbjad => repeated_letter(&ARABIC_ABJAD, n),
             NumFormat::Ordinal => format!("{n}{}", ordinal_suffix(n)),
             NumFormat::CardinalText => cardinal_text(n),
             NumFormat::OrdinalText => ordinal_text(n),
@@ -275,23 +343,23 @@ impl NumFormat {
             | NumFormat::DecimalHalfWidth
             | NumFormat::Hex
             | NumFormat::VietnameseCounting
-            | NumFormat::RussianLower
-            | NumFormat::RussianUpper
             | NumFormat::Hebrew1
             | NumFormat::Hebrew2
-            | NumFormat::ArabicAlpha
-            | NumFormat::ArabicAbjad
             | NumFormat::HindiVowels
             | NumFormat::HindiConsonants
             | NumFormat::HindiNumbers
             | NumFormat::HindiCounting
             | NumFormat::ThaiLetters
-            | NumFormat::ThaiNumbers
             | NumFormat::ThaiCounting
             | NumFormat::BahtText
             | NumFormat::DollarText => n.to_string(),
         }
     }
+}
+
+/// `n` in Thai digits, ๐ (U+0E50) to ๙ (#5757).
+fn thai_digits(n: u32) -> String {
+    n.to_string().chars().filter_map(|c| c.to_digit(10).and_then(|d| char::from_u32(0x0E50 + d))).collect()
 }
 
 /// Chicago Manual of Style note marks: *, †, ‡, §, then doubled (**, ††, …) and so on.
@@ -351,6 +419,43 @@ pub fn letters(n: u32) -> String {
     let n = n.min(780);
     let k = (n - 1) / 26 + 1;
     let c = (b'a' + ((n - 1) % 26) as u8) as char;
+    std::iter::repeat_n(c, k as usize).collect()
+}
+
+/// The 29 letters Word counts Russian lists with: а..я without ё, й, ъ and ь (ы stays).
+const RUSSIAN_LETTERS: [char; 29] =
+    ['а', 'б', 'в', 'г', 'д', 'е', 'ж', 'з', 'и', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'ы', 'э', 'ю', 'я'];
+
+/// Word-style Russian letters: а..я, аа..яя, ааа.. (repeated letter, as [`letters`]).
+pub fn russian_letters(n: u32) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let len = RUSSIAN_LETTERS.len() as u32;
+    let n = n.min(len * 30);
+    let k = (n - 1) / len + 1;
+    let c = RUSSIAN_LETTERS.get(((n - 1) % len) as usize).copied().unwrap_or('а');
+    std::iter::repeat_n(c, k as usize).collect()
+}
+
+/// `arabicAlpha`: the 28 letters in alphabetical (hijā'ī) order.
+const ARABIC_ALPHA: [char; 28] =
+    ['أ', 'ب', 'ت', 'ث', 'ج', 'ح', 'خ', 'د', 'ذ', 'ر', 'ز', 'س', 'ش', 'ص', 'ض', 'ط', 'ظ', 'ع', 'غ', 'ف', 'ق', 'ك', 'ل', 'م', 'ن', 'ه', 'و', 'ي'];
+
+/// `arabicAbjad`: the 28 letters in abjad order (أبجد هوز حطي كلمن سعفص قرشت ثخذ ضظغ).
+const ARABIC_ABJAD: [char; 28] =
+    ['أ', 'ب', 'ج', 'د', 'ه', 'و', 'ز', 'ح', 'ط', 'ي', 'ك', 'ل', 'م', 'ن', 'س', 'ع', 'ف', 'ص', 'ق', 'ر', 'ش', 'ت', 'ث', 'خ', 'ذ', 'ض', 'ظ', 'غ'];
+
+/// One letter of `alphabet`, repeated once per pass through it (as [`letters`]: a..z, aa..zz).
+fn repeated_letter(alphabet: &[char], n: u32) -> String {
+    let Some(&first) = alphabet.first() else { return n.to_string() };
+    if n == 0 {
+        return String::new();
+    }
+    let len = alphabet.len() as u32;
+    let n = n.min(len * 30);
+    let k = (n - 1) / len + 1;
+    let c = alphabet.get(((n - 1) % len) as usize).copied().unwrap_or(first);
     std::iter::repeat_n(c, k as usize).collect()
 }
 
@@ -667,6 +772,13 @@ pub struct SectionProps {
     /// Distance from the page edge to the header / footer.
     pub header: f32,
     pub footer: f32,
+    /// The space kept between a header and the body, and between the body and a footer, points
+    /// (ODF's header and footer spacing; Word keeps none). The margin already holds the band and
+    /// its spacing, so it only moves the body once content and spacing reach past the margin.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub header_gap: f32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub footer_gap: f32,
     pub gutter: f32,
     /// Mirror margins (inside/outside) — set from the document settings.
     pub columns: Columns,
@@ -676,8 +788,19 @@ pub struct SectionProps {
     pub title_page: bool,
     pub page_num_start: Option<u32>,
     pub page_num_format: NumFormat,
+    /// Chapter heading level and separator in `w:pgNumType`.
+    pub chapter_style: Option<u8>,
+    pub chapter_sep: Option<ChapterSep>,
+    /// The file carries a `w:pgNumType` element that sets nothing else (no start, decimal
+    /// format), so saving writes it back rather than dropping it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub page_num_set: bool,
     pub line_numbers: Option<LineNumbering>,
-    pub valign: VAlign,
+    pub valign: PageVAlign,
+    /// Form protection of the section (`w:formProt`, ECMA-376 §17.6.6): `Some` when the file
+    /// states it. Kept so saving writes it back; editing does not act on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form_prot: Option<bool>,
     pub page_borders: Option<Borders>,
     /// Text direction / bidi section.
     pub rtl: bool,
@@ -685,6 +808,9 @@ pub struct SectionProps {
     /// sections turn the page's text area (headers and footers stay horizontal).
     #[serde(skip_serializing_if = "is_horizontal")]
     pub text_direction: crate::props::TextDirection,
+    /// The file states the horizontal direction (`lrTb`) outright; saving writes it back.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub text_direction_set: bool,
     /// Tracked change of the section's properties (`w:sectPrChange`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fmt_change: Option<Box<crate::props::PropChange<SectionProps>>>,
@@ -695,6 +821,18 @@ pub struct SectionProps {
     pub footnote_pr: NoteProps,
     #[serde(skip_serializing_if = "NoteProps::is_empty")]
     pub endnote_pr: NoteProps,
+    /// First-page and other-page printer trays (`w:paperSrc`).
+    pub paper_src_first: Option<u16>,
+    pub paper_src_other: Option<u16>,
+    /// Section-specific suppression of endnotes (`w:noEndnote`).
+    pub no_endnote: Option<bool>,
+    /// Independent footnote column count (`w15:footnoteColumns`).
+    pub footnote_columns: Option<u32>,
+    /// Whether its columns end balanced (an ODF section's `text:dont-balance-text-columns`):
+    /// `None` is Word's rule, balanced when a continuous section follows; `Some(true)` also at
+    /// the end of the document, `Some(false)` never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_columns: Option<bool>,
 }
 
 impl Default for SectionProps {
@@ -711,6 +849,8 @@ impl Default for SectionProps {
             margin_right: 72.0,
             header: 36.0,
             footer: 36.0,
+            header_gap: 0.0,
+            footer_gap: 0.0,
             gutter: 0.0,
             columns: Columns::default(),
             headers: HeaderSet::default(),
@@ -718,17 +858,31 @@ impl Default for SectionProps {
             title_page: false,
             page_num_start: None,
             page_num_format: NumFormat::Decimal,
+            chapter_style: None,
+            chapter_sep: None,
+            page_num_set: false,
             line_numbers: None,
-            valign: VAlign::Top,
+            valign: PageVAlign::Top,
+            form_prot: None,
             page_borders: None,
             rtl: false,
             text_direction: crate::props::TextDirection::Horizontal,
+            text_direction_set: false,
             fmt_change: None,
             doc_grid: None,
             footnote_pr: NoteProps::default(),
             endnote_pr: NoteProps::default(),
+            paper_src_first: None,
+            paper_src_other: None,
+            no_endnote: None,
+            footnote_columns: None,
+            balance_columns: None,
         }
     }
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 fn is_horizontal(d: &crate::props::TextDirection) -> bool {
@@ -736,6 +890,16 @@ fn is_horizontal(d: &crate::props::TextDirection) -> bool {
 }
 
 impl SectionProps {
+    /// Join the section before this one into it, as when the break between them is deleted:
+    /// this section's setup stays, as in Word, and the headers and footers it leaves out (linked
+    /// to the previous section) are taken from `before`, so its text keeps showing them.
+    pub fn absorb(&mut self, before: &SectionProps) {
+        for (own, prev) in [(&mut self.headers, &before.headers), (&mut self.footers, &before.footers)] {
+            own.default = own.default.or(prev.default);
+            own.first = own.first.or(prev.first);
+            own.even = own.even.or(prev.even);
+        }
+    }
     /// Width of the text area, points.
     pub fn text_width(&self) -> f32 {
         (self.page_w - self.margin_left - self.margin_right - self.gutter).max(18.0)
@@ -831,11 +995,49 @@ mod tests {
         assert_eq!(NumFormat::ChineseCountingThousand.format(101), "一百零一");
         assert_eq!(NumFormat::DecimalEnclosedCircle.format(3), "③");
         assert_eq!(NumFormat::Hebrew1.format(3), "3", "formats not drawn yet show decimal");
+        assert_eq!(NumFormat::RussianLower.format(0), "");
+        assert_eq!(NumFormat::RussianUpper.format(u32::MAX).chars().count(), 30);
         for f in NumFormat::ALL {
             assert_eq!(NumFormat::from_ooxml(f.ooxml()), f, "{f:?} round-trips");
             assert!(f == NumFormat::Bullet || f == NumFormat::None || !f.format(u32::MAX).is_empty(), "{f:?}");
         }
         assert_eq!(NumFormat::from_ooxml("klingon"), NumFormat::Decimal, "unknown formats are decimal");
+    }
+
+    /// #5757: Thai numbers are the decimal number in Thai digits, every digit, at any length.
+    #[test]
+    fn thai_numbers_use_thai_digits() {
+        let labels: Vec<String> = [1, 2, 3, 9, 10, 11, 20, 105, 2569].iter().map(|n| NumFormat::ThaiNumbers.format(*n)).collect();
+        assert_eq!(labels.join(" "), "๑ ๒ ๓ ๙ ๑๐ ๑๑ ๒๐ ๑๐๕ ๒๕๖๙");
+        assert_eq!(NumFormat::ThaiNumbers.format(0), "๐");
+        assert_eq!(NumFormat::ThaiNumbers.format(u32::MAX), "๔๒๙๔๙๖๗๒๙๕");
+        assert_eq!(NumFormat::from_ooxml("thaiNumbers"), NumFormat::ThaiNumbers);
+        // Formats not drawn yet still show decimal.
+        assert_eq!(NumFormat::ThaiLetters.format(3), "3");
+    }
+
+    #[test]
+    fn russian_letters_follow_word() {
+        // Word's own labels for a russianLower list: no ё, й, ъ or ь, then doubled letters.
+        let labels: Vec<String> = (1..=31).map(|n| NumFormat::RussianLower.format(n)).collect();
+        assert_eq!(labels.join(" "), "а б в г д е ж з и к л м н о п р с т у ф х ц ч ш щ ы э ю я аа бб");
+        assert_eq!(NumFormat::RussianLower.format(59), "ааа");
+        assert_eq!(NumFormat::RussianLower.format(100), "нннн");
+        assert_eq!(NumFormat::RussianUpper.format(26), "Ы");
+        assert_eq!(NumFormat::RussianUpper.format(36), "ЖЖ");
+    }
+
+    #[test]
+    fn arabic_letters_count_in_both_orders() {
+        let alpha: Vec<String> = (1..=5).map(|n| NumFormat::ArabicAlpha.format(n)).collect();
+        assert_eq!(alpha.join(" "), "أ ب ت ث ج");
+        let abjad: Vec<String> = (1..=5).map(|n| NumFormat::ArabicAbjad.format(n)).collect();
+        assert_eq!(abjad.join(" "), "أ ب ج د ه");
+        assert_eq!(NumFormat::ArabicAlpha.format(28), "ي");
+        assert_eq!(NumFormat::ArabicAbjad.format(28), "غ");
+        // Past the 28th letter they double, as Latin and Russian letters do.
+        assert_eq!(NumFormat::ArabicAlpha.format(29), "أأ");
+        assert_eq!(NumFormat::ArabicAbjad.format(30), "بب");
     }
 
     #[test]
