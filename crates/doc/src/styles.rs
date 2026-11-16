@@ -3,7 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::props::{Align, Border, BorderStyle, Borders, CharProps, LineSpacing, ParaProps, Rgb, TabAlign, TabLeader, TabStop, TextColor, Underline};
+use std::collections::BTreeMap;
+
+use crate::props::{
+    Align, Border, BorderStyle, Borders, CharProps, LineSpacing, ParaProps, PropChange, Rgb, TabAlign, TabLeader, TabStop, TableLook, TextColor,
+    Underline, VAlign,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +46,17 @@ pub struct Style {
     /// (`w:locked`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// A tracked change of the style's paragraph properties (`w:pPrChange`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub para_change: Option<Box<PropChange<ParaProps>>>,
+    /// A tracked change of the style's run properties (`w:rPrChange`). Kept separate because a
+    /// foreign DOCX can attribute the two property changes to different revisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chr_change: Option<Box<PropChange<CharProps>>>,
+    /// The default style of its kind (`w:default`), whatever its id: localized documents call
+    /// the default character, table and list styles something other than the English ids.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
     /// Table style: conditional formatting for header row, banding etc.
     pub table: Option<TableStyleParts>,
 }
@@ -64,8 +80,13 @@ pub struct TableStyleParts {
     pub band_chr: CharProps,
     /// Cell borders of the odd row bands (`band1Horz` region's `w:tcBorders`).
     pub band_borders: Option<Borders>,
-    /// Rows per band (`w:tblStyleRowBandSize`); one when unset.
+    /// Rows per band (`w:tblStyleRowBandSize`). Unset (in the whole based-on chain) or zero, the
+    /// row bands are off: Word reads a missing size as zero, where ECMA-376 says one (MS-OE376
+    /// §2.7.5.7, #3415). Our own banded styles set one.
     pub band_size: Option<u32>,
+    /// Columns per band (`w:tblStyleColBandSize`); unset or zero, the column bands are off, as
+    /// in Word (MS-OI29500 §17.7.6.5).
+    pub col_band_size: Option<u32>,
     pub first_col_chr: CharProps,
     pub total_chr: CharProps,
     pub total_border_top: Option<Border>,
@@ -84,6 +105,207 @@ pub struct TableStyleParts {
     pub col_band_fill: Option<Rgb>,
     pub col_band_chr: CharProps,
     pub col_band_borders: Option<Borders>,
+    /// Per-part formatting the named fields above don't carry: every field of the parts without
+    /// one (even bands, corner cells), and the cell text alignment of every part. Read and write
+    /// parts through [`TableStyleParts::part`] / [`TableStyleParts::set_part`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub regions: BTreeMap<TablePart, PartFormat>,
+}
+
+/// A conditional formatting part of a table style (`w:tblStylePr/@w:type`, ECMA-376 §17.7.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TablePart {
+    WholeTable,
+    FirstRow,
+    LastRow,
+    FirstCol,
+    LastCol,
+    Band1Vert,
+    Band2Vert,
+    Band1Horz,
+    Band2Horz,
+    NeCell,
+    NwCell,
+    SeCell,
+    SwCell,
+}
+
+impl TablePart {
+    /// Every part, lowest precedence first (ECMA-376 §17.7.6: whole table, bands, first/last
+    /// column, first/last row, corner cells).
+    pub const ALL: [TablePart; 13] = [
+        TablePart::WholeTable,
+        TablePart::Band1Vert,
+        TablePart::Band2Vert,
+        TablePart::Band1Horz,
+        TablePart::Band2Horz,
+        TablePart::FirstCol,
+        TablePart::LastCol,
+        TablePart::FirstRow,
+        TablePart::LastRow,
+        TablePart::NeCell,
+        TablePart::NwCell,
+        TablePart::SeCell,
+        TablePart::SwCell,
+    ];
+    /// The `w:type` value.
+    pub fn ooxml(self) -> &'static str {
+        match self {
+            TablePart::WholeTable => "wholeTable",
+            TablePart::FirstRow => "firstRow",
+            TablePart::LastRow => "lastRow",
+            TablePart::FirstCol => "firstCol",
+            TablePart::LastCol => "lastCol",
+            TablePart::Band1Vert => "band1Vert",
+            TablePart::Band2Vert => "band2Vert",
+            TablePart::Band1Horz => "band1Horz",
+            TablePart::Band2Horz => "band2Horz",
+            TablePart::NeCell => "neCell",
+            TablePart::NwCell => "nwCell",
+            TablePart::SeCell => "seCell",
+            TablePart::SwCell => "swCell",
+        }
+    }
+    pub fn from_ooxml(s: &str) -> Option<TablePart> {
+        TablePart::ALL.into_iter().find(|p| p.ooxml() == s)
+    }
+    /// A part spanning whole rows (its left/right edges are the table's sides, `inside_v` the
+    /// edges between its cells).
+    pub fn is_row(self) -> bool {
+        matches!(self, TablePart::FirstRow | TablePart::LastRow | TablePart::Band1Horz | TablePart::Band2Horz)
+    }
+    /// A part spanning whole columns (its top/bottom edges are the table's, `between` the edges
+    /// between its cells).
+    pub fn is_column(self) -> bool {
+        matches!(self, TablePart::FirstCol | TablePart::LastCol | TablePart::Band1Vert | TablePart::Band2Vert)
+    }
+    fn bit(self) -> u16 {
+        1 << (TablePart::ALL.iter().position(|p| *p == self).unwrap_or(0) as u16)
+    }
+}
+
+/// The table style parts one cell is in (always the whole table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PartSet(u16);
+
+impl PartSet {
+    /// The parts of the cell at row `ri` of `nrows`, grid column `g` spanning `span` of `ncols`,
+    /// in a table with options `look`, row bands of `row_size` rows and column bands of
+    /// `col_size` columns (a size of zero turns those bands off, as in Word).
+    pub fn of_cell(
+        look: &TableLook,
+        (row_size, col_size): (u32, u32),
+        (ri, nrows): (usize, usize),
+        (g, span, ncols): (usize, usize, usize),
+    ) -> PartSet {
+        let header = look.header_row && ri == 0;
+        let total = look.total_row && ri + 1 == nrows && nrows > 1;
+        let first_col = look.first_column && g == 0;
+        let last_col = look.last_column && g.saturating_add(span) >= ncols && ncols > 1;
+        let rows = row_size.min(1000) as usize;
+        let cols = col_size.min(1000) as usize;
+        let row_band = look.banded_rows && !header && rows > 0;
+        let odd_row = (ri.saturating_sub(usize::from(look.header_row)) / rows.max(1)).is_multiple_of(2);
+        let col_band = look.banded_columns && !first_col && cols > 0;
+        let odd_col = (g.saturating_sub(usize::from(look.first_column)) / cols.max(1)).is_multiple_of(2);
+        let mut bits = TablePart::WholeTable.bit();
+        for (on, p) in [
+            (col_band && odd_col, TablePart::Band1Vert),
+            (col_band && !odd_col, TablePart::Band2Vert),
+            (row_band && odd_row, TablePart::Band1Horz),
+            (row_band && !odd_row, TablePart::Band2Horz),
+            (first_col, TablePart::FirstCol),
+            (last_col, TablePart::LastCol),
+            (header, TablePart::FirstRow),
+            (total, TablePart::LastRow),
+            (header && last_col, TablePart::NeCell),
+            (header && first_col, TablePart::NwCell),
+            (total && last_col, TablePart::SeCell),
+            (total && first_col, TablePart::SwCell),
+        ] {
+            if on {
+                bits |= p.bit();
+            }
+        }
+        PartSet(bits)
+    }
+    pub fn contains(self, p: TablePart) -> bool {
+        self.0 & p.bit() != 0
+    }
+    /// The parts, lowest precedence first.
+    pub fn iter(self) -> impl Iterator<Item = TablePart> {
+        TablePart::ALL.into_iter().filter(move |p| self.contains(*p))
+    }
+}
+
+/// A cell's borders from the table style's parts it is in, later parts winning. Row parts give
+/// their left/right edges at the table's sides and `inside_v` between cells; column parts their
+/// top/bottom edges at the table's top and bottom and `between` between rows; corner cells their
+/// four edges.
+pub fn part_borders(parts: &[(TablePart, Borders)], (ri, nrows): (usize, usize), (first_g, last_g): (bool, bool)) -> Borders {
+    let mut out = Borders::default();
+    for (part, b) in parts {
+        let b = *b;
+        let mapped = if part.is_row() {
+            Borders {
+                top: b.top,
+                bottom: b.bottom,
+                left: if first_g { b.left } else { b.inside_v },
+                right: if last_g { b.right } else { b.inside_v },
+                between: None,
+                inside_v: None,
+            }
+        } else if part.is_column() {
+            Borders {
+                top: if ri == 0 { b.top } else { b.between },
+                bottom: if ri + 1 >= nrows { b.bottom } else { b.between },
+                left: b.left,
+                right: b.right,
+                between: None,
+                inside_v: None,
+            }
+        } else {
+            Borders { between: None, inside_v: None, ..b }
+        };
+        out.overlay(&mapped);
+    }
+    out
+}
+
+/// What one table style part gives its cells.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PartFormat {
+    pub chr: CharProps,
+    /// Cell shading.
+    pub fill: Option<Rgb>,
+    /// Cell borders (the whole table's are the table borders).
+    pub borders: Option<Borders>,
+    /// Horizontal alignment of the cells' paragraphs (`w:pPr/w:jc`).
+    pub align: Option<Align>,
+    /// Vertical alignment in the cells (`w:tcPr/w:vAlign`).
+    pub v_align: Option<VAlign>,
+}
+
+impl PartFormat {
+    pub fn is_empty(&self) -> bool {
+        *self == PartFormat::default()
+    }
+    /// What `patch` sets wins; borders merge edge by edge.
+    pub fn overlay(&mut self, patch: &PartFormat) {
+        self.chr.overlay(&patch.chr);
+        self.fill = patch.fill.or(self.fill);
+        self.borders = match (self.borders, patch.borders) {
+            (Some(mut b), Some(p)) => {
+                b.overlay(&p);
+                Some(b)
+            }
+            (b, p) => p.or(b),
+        };
+        self.align = patch.align.or(self.align);
+        self.v_align = patch.v_align.or(self.v_align);
+    }
 }
 
 impl TableStyleParts {
@@ -101,6 +323,7 @@ impl TableStyleParts {
         self.header_borders = merge(self.header_borders, patch.header_borders);
         self.band_borders = merge(self.band_borders, patch.band_borders);
         self.band_size = patch.band_size.or(self.band_size);
+        self.col_band_size = patch.col_band_size.or(self.col_band_size);
         self.band_chr.overlay(&patch.band_chr);
         self.fill = patch.fill.or(self.fill);
         self.cell_margins = patch.cell_margins.or(self.cell_margins);
@@ -120,6 +343,125 @@ impl TableStyleParts {
         self.col_band_fill = patch.col_band_fill.or(self.col_band_fill);
         self.col_band_chr.overlay(&patch.col_band_chr);
         self.col_band_borders = merge(self.col_band_borders, patch.col_band_borders);
+        for (k, f) in &patch.regions {
+            self.regions.entry(*k).or_default().overlay(f);
+        }
+    }
+
+    /// Part `p`'s formatting. The whole table's text formatting is the style's own
+    /// ([`Style::table_part`] adds it); its borders are the table borders.
+    pub fn part(&self, p: TablePart) -> PartFormat {
+        let extra = self.regions.get(&p).cloned().unwrap_or_default();
+        let named = |chr: &CharProps, fill: Option<Rgb>, borders: Option<Borders>| PartFormat {
+            chr: chr.clone(),
+            fill,
+            borders,
+            align: extra.align,
+            v_align: extra.v_align,
+        };
+        match p {
+            TablePart::WholeTable => {
+                PartFormat { chr: CharProps::default(), fill: self.fill, borders: self.borders, align: None, v_align: extra.v_align }
+            }
+            TablePart::FirstRow => named(&self.header_chr, self.header_fill, self.header_borders),
+            TablePart::LastRow => {
+                // The built-in top rule is the region's top edge unless its borders set one.
+                let borders = match (self.total_borders, self.total_border_top) {
+                    (Some(mut b), top) => {
+                        b.top = b.top.or(top);
+                        Some(b)
+                    }
+                    (None, top) => top.map(|t| Borders { top: Some(t), ..Borders::default() }),
+                };
+                named(&self.total_chr, self.total_fill, borders)
+            }
+            TablePart::FirstCol => named(&self.first_col_chr, self.first_col_fill, self.first_col_borders),
+            TablePart::LastCol => named(&self.last_col_chr, self.last_col_fill, self.last_col_borders),
+            TablePart::Band1Vert => named(&self.col_band_chr, self.col_band_fill, self.col_band_borders),
+            TablePart::Band1Horz => named(&self.band_chr, self.band_fill, self.band_borders),
+            _ => extra,
+        }
+    }
+
+    /// Replace part `p`'s formatting (for the whole table only its fill, borders and vertical
+    /// alignment: [`Style::set_table_part`] stores the rest).
+    pub fn set_part(&mut self, p: TablePart, f: PartFormat) {
+        let align_only = PartFormat { align: f.align, v_align: f.v_align, ..PartFormat::default() };
+        let PartFormat { chr, fill, borders, .. } = f.clone();
+        let rest = match p {
+            TablePart::WholeTable => {
+                self.fill = fill;
+                self.borders = borders;
+                PartFormat { v_align: f.v_align, ..PartFormat::default() }
+            }
+            TablePart::FirstRow => {
+                (self.header_chr, self.header_fill, self.header_borders) = (chr, fill, borders);
+                align_only
+            }
+            TablePart::LastRow => {
+                (self.total_chr, self.total_fill) = (chr, fill);
+                self.total_border_top = borders.and_then(|b| b.top);
+                self.total_borders = borders.map(|b| Borders { top: None, ..b }).filter(|b| *b != Borders::default());
+                align_only
+            }
+            TablePart::FirstCol => {
+                (self.first_col_chr, self.first_col_fill, self.first_col_borders) = (chr, fill, borders);
+                align_only
+            }
+            TablePart::LastCol => {
+                (self.last_col_chr, self.last_col_fill, self.last_col_borders) = (chr, fill, borders);
+                align_only
+            }
+            TablePart::Band1Vert => {
+                (self.col_band_chr, self.col_band_fill, self.col_band_borders) = (chr, fill, borders);
+                align_only
+            }
+            TablePart::Band1Horz => {
+                (self.band_chr, self.band_fill, self.band_borders) = (chr, fill, borders);
+                align_only
+            }
+            _ => f,
+        };
+        if rest.is_empty() {
+            self.regions.remove(&p);
+        } else {
+            self.regions.insert(p, rest);
+        }
+    }
+}
+
+impl Style {
+    /// Table style part `p` as this style alone sets it (the whole table's text formatting and
+    /// paragraph alignment are the style's own).
+    pub fn table_part(&self, p: TablePart) -> PartFormat {
+        let mut f = self.table.as_ref().map(|t| t.part(p)).unwrap_or_default();
+        if p == TablePart::WholeTable {
+            f.chr = self.chr.clone();
+            f.align = self.para.align;
+        }
+        f
+    }
+    /// Replace part `p` of this table style.
+    pub fn set_table_part(&mut self, p: TablePart, f: PartFormat) {
+        if p == TablePart::WholeTable {
+            self.chr = f.chr.clone();
+            self.para.align = f.align;
+        }
+        let mut t = self.table.take().unwrap_or_default();
+        t.set_part(p, f);
+        self.table = (t != TableStyleParts::default()).then_some(t);
+    }
+}
+
+impl TableStyleProps {
+    /// Part `p` with the based-on chain merged (see [`Style::table_part`]).
+    pub fn part(&self, p: TablePart) -> PartFormat {
+        let mut f = self.parts.part(p);
+        if p == TablePart::WholeTable {
+            f.chr = self.chr.clone();
+            f.align = self.para.align;
+        }
+        f
     }
 }
 
@@ -142,6 +484,10 @@ pub struct StyleSheet {
     /// the application; nonempty `default_para` is always written after spacing edits.
     pub default_para_present: bool,
     pub styles: Vec<Style>,
+    /// The file's `w:latentStyles` (behaviour of built-in styles not defined in the document:
+    /// gallery, priority, visibility), as XML, written back as is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latent_styles: Option<String>,
 }
 
 impl Default for StyleSheet {
@@ -168,13 +514,19 @@ fn color(c: Rgb) -> Option<TextColor> {
 
 impl StyleSheet {
     pub fn empty() -> Self {
-        StyleSheet { default_chr: CharProps::default(), default_para: ParaProps::default(), default_para_present: true, styles: Vec::new() }
+        StyleSheet {
+            default_chr: CharProps::default(),
+            default_para: ParaProps::default(),
+            default_para_present: true,
+            styles: Vec::new(),
+            latent_styles: None,
+        }
     }
 
     /// The built-in style set used for new documents.
     pub fn builtin() -> Self {
         let mut s = StyleSheet {
-            default_chr: CharProps { font: Some(BODY_FONT.into()), size: Some(12.0), kern: Some(0.0), lang: Some("en-US".into()), ..chr() },
+            default_chr: CharProps { font: Some(BODY_FONT.into()), size: Some(12.0), kern: Some(1.0), lang: Some("en-US".into()), ..chr() },
             default_para: ParaProps {
                 space_after: Some(8.0),
                 space_before: Some(0.0),
@@ -184,6 +536,7 @@ impl StyleSheet {
             },
             default_para_present: true,
             styles: Vec::new(),
+            latent_styles: None,
         };
         let mut add = |st: Style| s.styles.push(st);
         add(Style { id: "Normal".into(), name: "Normal".into(), priority: Some(0), quick: true, ..p_style() });
@@ -444,6 +797,19 @@ impl StyleSheet {
         out.reverse();
         out
     }
+    /// Which indents (left, first line) of a paragraph that gets its list from style `id` the style
+    /// chain sets over the list level's own. Word applies the level's indents on top of the most
+    /// derived style that gives a list, so that style and the ones based on it win over the level,
+    /// and the styles it is based on don't (Heading 3 with its own left indent on Heading 2's
+    /// list). `(false, false)` when no style in the chain gives a list.
+    pub fn indents_over_list(&self, id: &str) -> (bool, bool) {
+        let chain = self.chain(id);
+        let Some(k) = chain.iter().rposition(|s| s.para.numbering.is_some()) else { return (false, false) };
+        let set = |v: Option<f32>, chars: Option<f32>| v.is_some() || chars.is_some_and(|c| c != 0.0);
+        chain.get(k..).unwrap_or_default().iter().fold((false, false), |(l, f), s| {
+            (l || set(s.para.indent_left, s.para.indent_left_chars), f || set(s.para.indent_first, s.para.indent_first_chars))
+        })
+    }
     /// Table style `id` with its based-on chain merged, base styles first (`None` when there is no
     /// such table style). Styles of other kinds in the chain are skipped.
     pub fn table_style(&self, id: &str) -> Option<TableStyleProps> {
@@ -468,6 +834,33 @@ impl StyleSheet {
         match self.styles.iter_mut().find(|s| s.id == st.id) {
             Some(s) => *s = st,
             None => self.styles.push(st),
+        }
+    }
+    /// For a file from a producer that never writes `w:qFormat` (LibreOffice): give it Word's
+    /// usual Quick Styles gallery. Each built-in style whose id or name matches a quick style of
+    /// [`StyleSheet::builtin`] becomes quick (taking the built-in's priority when it has none), and
+    /// the quick built-ins the file lacks are added with their linked styles. Existing ids and
+    /// names are never overwritten. Callers use it only when no style in the file is quick.
+    pub fn add_default_gallery(&mut self) {
+        let builtin = StyleSheet::builtin();
+        for q in builtin.styles.iter().filter(|s| s.quick && s.kind != StyleKind::Table) {
+            let found =
+                self.styles.iter().position(|s| s.id == q.id).or_else(|| self.styles.iter().position(|s| s.name.eq_ignore_ascii_case(&q.name)));
+            if let Some(st) = found.and_then(|i| self.styles.get_mut(i)) {
+                if st.builtin && st.kind == q.kind {
+                    st.quick = true;
+                    st.priority = st.priority.or(q.priority);
+                }
+                continue;
+            }
+            for sid in std::iter::once(q.id.as_str()).chain(q.linked.as_deref()) {
+                if let Some(b) = builtin.get(sid)
+                    && self.get(sid).is_none()
+                    && self.find(&b.name).is_none()
+                {
+                    self.styles.push(b.clone());
+                }
+            }
         }
     }
     /// Remove style `id` and return it. Styles based on it are rebased onto its own base, and
@@ -507,6 +900,7 @@ fn p_style() -> Style {
 /// A few table styles of our own (grid, plain, light/medium accents).
 fn table_styles() -> Vec<Style> {
     let thin = |c: Rgb| Border { style: BorderStyle::Single, width: 0.5, color: Some(c), space: 0.0 };
+    // Bands of one row and one column, written out so Word bands them too (#3415).
     let mk = |id: &str, name: &str, parts: TableStyleParts| Style {
         id: id.into(),
         name: name.into(),
@@ -515,7 +909,7 @@ fn table_styles() -> Vec<Style> {
         para: ParaProps { space_after: Some(0.0), line_spacing: Some(LineSpacing::Multiple(1.0)), ..ParaProps::default() },
         priority: Some(60),
         builtin: true,
-        table: Some(parts),
+        table: Some(TableStyleParts { band_size: Some(1), col_band_size: Some(1), ..parts }),
         ..Default::default()
     };
     let accents = [
@@ -579,6 +973,31 @@ fn table_styles() -> Vec<Style> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolve::ResolvedPara;
+
+    #[test]
+    fn adjust_right_indent_inherits_and_can_be_overridden() {
+        let resolved = StyleSheet::empty().resolve_para(&ParaProps::default());
+        assert!(resolved.adjust_right_indent);
+
+        let mut older_json = serde_json::to_value(&resolved).unwrap();
+        older_json.as_object_mut().unwrap().remove("adjustRightIndent");
+        assert!(serde_json::from_value::<ResolvedPara>(older_json).unwrap().adjust_right_indent);
+
+        let mut s = StyleSheet::empty();
+        s.styles.push(Style {
+            id: "Normal".into(),
+            name: "Normal".into(),
+            para: ParaProps { adjust_right_indent: Some(true), ..Default::default() },
+            ..Default::default()
+        });
+        assert!(s.resolve_para(&ParaProps::default()).adjust_right_indent);
+        assert!(!s.resolve_para(&ParaProps { adjust_right_indent: Some(false), ..Default::default() }).adjust_right_indent);
+
+        let json = serde_json::to_value(ParaProps { adjust_right_indent: Some(false), ..Default::default() }).unwrap();
+        assert_eq!(json["adjustRightIndent"], false);
+        assert_eq!(serde_json::from_value::<ParaProps>(json).unwrap().adjust_right_indent, Some(false));
+    }
 
     #[test]
     fn builtins_present() {
@@ -590,6 +1009,32 @@ mod tests {
         let g = s.gallery();
         assert_eq!(g.first().map(|s| s.id.as_str()), Some("Normal"));
         assert!(g.iter().any(|s| s.id == "Heading1"));
+    }
+
+    #[test]
+    fn default_gallery_marks_and_adds_quick_builtins() {
+        let b = StyleSheet::builtin();
+        let mut s = StyleSheet::empty();
+        let plain = |id: &str, name: &str| Style { id: id.into(), name: name.into(), builtin: true, ..Default::default() };
+        s.styles.push(plain("Normal", "Normal"));
+        s.styles.push(plain("Heading1", "heading 1"));
+        s.styles.push(Style { priority: Some(7), ..plain("Heading2", "Heading 2") });
+        s.styles.push(Style { builtin: false, ..plain("Heading3", "Heading 3") });
+        s.styles.push(Style { para: ParaProps { space_after: Some(99.0), ..Default::default() }, ..plain("Custom1", "Subtitle") });
+        s.add_default_gallery();
+        let ids: Vec<&str> = s.gallery().iter().map(|x| x.id.as_str()).collect();
+        for id in ["Normal", "NoSpacing", "Heading1", "Heading2", "Title"] {
+            assert!(ids.contains(&id), "{id} in {ids:?}");
+        }
+        let mut bare = StyleSheet::empty();
+        bare.add_default_gallery();
+        assert!(bare.get("Heading1").is_some_and(|x| x.quick) && bare.get("Title").is_some(), "missing quick builtins added");
+        assert_eq!(s.get("Heading2").and_then(|x| x.priority), Some(7), "file priority kept");
+        assert_eq!(s.get("Heading1").and_then(|x| x.priority), b.get("Heading1").and_then(|x| x.priority));
+        assert!(!s.get("Heading3").is_some_and(|x| x.quick), "custom style untouched");
+        assert!(s.get("Subtitle").is_none(), "a style with that name exists: not duplicated");
+        assert!(s.get("Custom1").is_some_and(|x| x.quick), "found by name only, built in: quick");
+        assert_eq!(s.get("Custom1").and_then(|x| x.para.space_after), Some(99.0));
     }
 
     #[test]
@@ -612,6 +1057,25 @@ mod tests {
         }
         let c = s.chain("Heading1");
         assert!(c.len() <= 2);
+    }
+
+    /// #3415: a band size of zero (Word's reading of a style without one) turns those bands off.
+    #[test]
+    fn band_size_zero_turns_bands_off() {
+        let look = crate::props::TableLook { banded_columns: true, ..Default::default() };
+        let parts = |sizes, ri, g| PartSet::of_cell(&look, sizes, (ri, 5), (g, 1, 4));
+        assert!(parts((1, 1), 1, 1).contains(TablePart::Band1Horz) && parts((1, 1), 1, 1).contains(TablePart::Band1Vert));
+        assert!(parts((1, 1), 2, 2).contains(TablePart::Band2Horz) && parts((1, 1), 2, 2).contains(TablePart::Band2Vert));
+        for (ri, g) in [(1, 1), (2, 2)] {
+            let p = parts((0, 0), ri, g);
+            for band in [TablePart::Band1Horz, TablePart::Band2Horz, TablePart::Band1Vert, TablePart::Band2Vert] {
+                assert!(!p.contains(band), "{band:?} at row {ri}, column {g}");
+            }
+        }
+        // Our banded styles say so, so Word bands them too.
+        let s = StyleSheet::builtin();
+        let t = s.table_style("GridTable4AccentBlue").map(|t| t.parts);
+        assert_eq!(t.map(|t| (t.band_size, t.col_band_size)), Some((Some(1), Some(1))));
     }
 
     /// A table style based on another inherits what it doesn't set itself; borders merge edge by

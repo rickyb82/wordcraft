@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
+use wordcraft_doc::collate::{SortKey, heading_letter, sort_key};
 use wordcraft_doc::para::InlineObject;
 use wordcraft_doc::props::{CharProps, TabAlign, TabLeader, TabStop};
 use wordcraft_doc::section::SectionStart;
 use wordcraft_doc::{Block, Paragraph, Path, Pos, StoryRef};
 
-use super::references::{FieldCode, leader};
+use super::references::{FieldCode, field_arg, leader};
 use super::sel_result;
 use crate::{CmdError, CmdResult, CommandSpec, Session, p};
 
@@ -43,11 +44,12 @@ fn xe_instr(s: &Session, v: &Value, main: &str) -> Result<String, CmdError> {
     let mut instr = if sub.is_empty() { format!("XE \"{main}\"") } else { format!("XE \"{main}:{sub}\"") };
     if let Some(see) = p::str(v, "crossReference").map(|t| clean(t, 200)).filter(|t| !t.is_empty()) {
         instr.push_str(&format!(" \\t \"{see}\""));
-    } else if let Some(bm) = p::str(v, "bookmark").filter(|b| !b.trim().is_empty()) {
+    } else if let Some(bm) = p::str(v, "bookmark").map(str::trim).filter(|b| !b.is_empty()) {
         if !s.doc.bookmarks().iter().any(|(n, _)| n == bm) {
             return Err(CmdError::Params(format!("no bookmark `{bm}`")));
         }
-        instr.push_str(&format!(" \\r {}", bm.trim()));
+        // A name read from a file may hold a space, a quote or a backslash.
+        instr.push_str(&format!(" \\r {}", field_arg(bm)));
     }
     if p::bool(v, "bold").unwrap_or(false) {
         instr.push_str(" \\b");
@@ -65,7 +67,7 @@ fn mark_entry(s: &mut Session, v: &Value) -> CmdResult {
     }
     let instr = xe_instr(s, v, &main)?;
     let hidden = CharProps { hidden: Some(true), ..Default::default() };
-    let field = || InlineObject::Field { instr: instr.clone(), result: String::new(), locked: false, code: false };
+    let field = || InlineObject::Field { instr: instr.clone(), result: String::new(), locked: false, dirty: false, code: false, form: String::new() };
     if !p::bool(v, "all").unwrap_or(false) {
         let (_, b) = s.sel.ordered();
         s.doc.insert_object(&b, field(), &hidden)?;
@@ -167,14 +169,15 @@ struct PageRef {
 
 #[derive(Default)]
 struct Node {
-    /// The entry's levels as written (the key is their lower-case form).
+    /// The entry's levels as written (the key is their sort keys).
     levels: Vec<String>,
     pages: Vec<PageRef>,
     see: Vec<String>,
 }
 
-/// Every XE entry in the body with its page (or page range), grouped by entry.
-fn collect(s: &mut Session) -> BTreeMap<Vec<String>, Node> {
+/// Every XE entry in the body with its page (or page range), grouped by entry and sorted in the
+/// order of language `lang` (Polish files `Łódź` between `L` and `M`).
+fn collect(s: &mut Session, lang: Option<&str>) -> BTreeMap<Vec<SortKey>, Node> {
     let mut marks: Vec<(FieldCode, Pos)> = Vec::new();
     for path in s.doc.para_paths(StoryRef::Body) {
         let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
@@ -197,7 +200,7 @@ fn collect(s: &mut Session) -> BTreeMap<Vec<String>, Node> {
         })
     };
     let starts = s.doc.bookmarks();
-    let mut tree: BTreeMap<Vec<String>, Node> = BTreeMap::new();
+    let mut tree: BTreeMap<Vec<SortKey>, Node> = BTreeMap::new();
     for (f, pos) in marks {
         let text = f.args.first().cloned().unwrap_or_default();
         let levels: Vec<String> = text.split(':').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).take(9).collect();
@@ -207,10 +210,10 @@ fn collect(s: &mut Session) -> BTreeMap<Vec<String>, Node> {
         // Every level above gets a line of its own, even without pages.
         for k in 1..levels.len() {
             let head: Vec<String> = levels.iter().take(k).cloned().collect();
-            tree.entry(head.iter().map(|x| x.to_lowercase()).collect()).or_insert_with(|| Node { levels: head, ..Default::default() });
+            tree.entry(head.iter().map(|x| sort_key(x, lang)).collect()).or_insert_with(|| Node { levels: head, ..Default::default() });
         }
         let node =
-            tree.entry(levels.iter().map(|x| x.to_lowercase()).collect()).or_insert_with(|| Node { levels: levels.clone(), ..Default::default() });
+            tree.entry(levels.iter().map(|x| sort_key(x, lang)).collect()).or_insert_with(|| Node { levels: levels.clone(), ..Default::default() });
         if let Some(see) = f.arg('t') {
             if !node.see.iter().any(|x| x == see) {
                 node.see.push(see.to_string());
@@ -262,6 +265,12 @@ pub fn rebuild(s: &mut Session, i: usize, leader: Option<TabLeader>) -> Result<(
     }) else {
         return Ok(());
     };
+    rebuild_from(s, i, leader, instr)
+}
+
+/// [`rebuild`] the index at body block `i` from field code `instr` (that of the index field in
+/// it, when the paragraph holds more than one).
+pub fn rebuild_from(s: &mut Session, i: usize, leader: Option<TabLeader>, instr: String) -> Result<(), CmdError> {
     let f = FieldCode::parse(&instr);
     // Old entries go; keep their leader and the section their columns had.
     let mut old_leader = None;
@@ -278,7 +287,9 @@ pub fn rebuild(s: &mut Session, i: usize, leader: Option<TabLeader>) -> Result<(
     let sep = f.arg('e').map(str::to_string).unwrap_or_else(|| ", ".into());
     let run_in = f.has('r');
     let headings = f.switches.iter().find(|(c, _)| *c == 'h').map(|(_, a)| a.clone().unwrap_or_default());
-    let tree = collect(s);
+    // Entries sort in the language of the index's paragraph (else the document's).
+    let lang = s.doc.body.get(i).and_then(|b| b.as_para()).and_then(|p| super::para_lang(&s.doc, p)).or_else(|| super::default_lang(s));
+    let tree = collect(s, lang.as_deref());
     let mut lines: Vec<(usize, Line)> = Vec::new();
     let mut letter: Option<String> = None;
     let mut keys = tree.keys().peekable();
@@ -286,7 +297,7 @@ pub fn rebuild(s: &mut Session, i: usize, leader: Option<TabLeader>) -> Result<(
         let Some(node) = tree.get(key) else { continue };
         let Some(main) = node.levels.first() else { continue };
         if let Some(h) = &headings {
-            let first = main.chars().next().map(|c| c.to_uppercase().to_string());
+            let first = heading_letter(main, lang.as_deref());
             if first != letter {
                 if letter.is_some() || !h.is_empty() {
                     lines.push((0, vec![(if h.is_empty() { String::new() } else { first.clone().unwrap_or_default() }, CharProps::default())]));
@@ -387,6 +398,36 @@ mod tests {
 
     fn index_lines(s: &Session) -> Vec<String> {
         s.doc.body.iter().filter_map(|b| b.as_para()).filter(|p| p.props.style.as_deref() == Some(ENTRY_STYLE)).map(|p| p.plain_text()).collect()
+    }
+
+    /// #3669: the bookmark is looked up trimmed, and a name with a space or a quote (one a file
+    /// can hold) is quoted in the XE field, so it reads back whole.
+    #[test]
+    fn mark_entry_trims_and_quotes_its_bookmark() {
+        let mut s = Session::new(wordcraft_doc::Document::from_text("Intro text.\nMore text."));
+        s.run("select.text", &json!({"text": "Intro"})).unwrap();
+        s.run("insert.bookmark", &json!({"name": "Intro"})).unwrap();
+        let odd = "My \"Mark\" \\b";
+        let p = s.doc.para_mut(StoryRef::Body, &Path::top(1)).unwrap();
+        p.insert_object(0, InlineObject::BookmarkStart { name: odd.into() }, &CharProps::default()).unwrap();
+        s.run("caret.docEnd", &json!({})).unwrap();
+        s.run("references.markEntry", &json!({"entry": "Alpha", "bookmark": " Intro "})).unwrap();
+        s.run("references.markEntry", &json!({"entry": "Beta", "bookmark": odd})).unwrap();
+        let mut instrs: Vec<String> = s
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| b.as_para())
+            .flat_map(|p| p.objects.iter())
+            .filter_map(|o| match o {
+                InlineObject::Field { instr, .. } if instr.starts_with("XE") => Some(instr.clone()),
+                _ => None,
+            })
+            .collect();
+        instrs.sort();
+        assert_eq!(instrs, vec![r#"XE "Alpha" \r Intro"#, r#"XE "Beta" \r "My \"Mark\" \\b""#]);
+        let beta = FieldCode::parse(&instrs[1]);
+        assert_eq!((beta.arg('r'), beta.has('b')), (Some(odd), false));
     }
 
     /// #402: Mark Entry writes XE switches (subentry, bold page, cross-reference, Mark All) and

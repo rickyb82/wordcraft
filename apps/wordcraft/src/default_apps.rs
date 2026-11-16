@@ -36,7 +36,8 @@ const DESKTOP_ID: &str = "ai.storyteller.wordcraft.desktop";
 
 /// The types the button makes WordCraft the default for on Linux and BSD: Word documents and
 /// templates (also macro-enabled and legacy), RTF and ODT. The same set the Windows installer
-/// lists under WordCraft's Capabilities; Markdown and plain text are only offered under Open With.
+/// lists under WordCraft's Capabilities; Markdown is only offered under Open With, and plain
+/// text only on Windows and macOS (the `.desktop` file leaves it out, #4137).
 /// Every one is in the `.desktop` file's `MimeType=` (a test checks).
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 const WORD_MIME_TYPES: &[&str] = &[
@@ -61,7 +62,7 @@ fn xdg_mime_args(desktop_id: &str) -> Vec<String> {
 /// The `applications` folders the desktop looks for entries in, from `XDG_DATA_HOME` (default
 /// `~/.local/share`) and `XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`). Relative paths
 /// are ignored, as the XDG Base Directory spec says.
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
 fn application_dirs(data_home: Option<&str>, data_dirs: Option<&str>, home: Option<&str>) -> Vec<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
     let absolute = |s: &&str| Path::new(s).is_absolute();
@@ -130,6 +131,7 @@ mod xdg {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     use super::*;
@@ -163,6 +165,17 @@ mod tests {
         assert!(entry.lines().any(|l| l == "Exec=wordcraft %F"), "files are passed on the command line");
     }
 
+    /// Declaring `text/plain` makes WordCraft a handler for every config, script and log on systems with no default set.
+    #[test]
+    fn the_desktop_entry_does_not_declare_plain_text() {
+        let entry = include_str!("../../../packaging/linux/ai.storyteller.wordcraft.desktop");
+        let declared: Vec<&str> =
+            entry.lines().find_map(|l| l.strip_prefix("MimeType=")).map(|v| v.split(';').filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+        assert!(!declared.is_empty(), "MimeType= line not found");
+        assert!(!declared.contains(&"text/plain"), "text/plain must not be declared");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn application_dirs_follow_the_xdg_spec() {
         let p = |s: &str| PathBuf::from(s);
