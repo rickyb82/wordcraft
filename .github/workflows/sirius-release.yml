@@ -18,7 +18,7 @@ on:
   push:
     tags: ["sirius-v*"]
   pull_request:
-    paths: [".github/workflows/sirius-release.yml", "packaging/**", "assets/app-icon/**"]
+    paths: [".github/workflows/sirius-release.yml", "packaging/**", "assets/app-icon/**", "craft-i18n.rev"]
 
 permissions:
   contents: write
@@ -71,6 +71,22 @@ jobs:
           repository: storytold/craft-fonts
           ref: ${{ env.CRAFT_FONTS_REF }}
           path: craft-fonts
+      # The interface translations and the language data (hyphenation, spelling) are not in this repository:
+      # the build embeds them from storytold/craft-i18n at the commit in craft-i18n.rev, and without them
+      # the app is English only.
+      - id: i18n
+        name: Read the craft-i18n pin
+        shell: bash
+        run: |
+          rev=$(tr -d ' \t\r\n' < craft-i18n.rev)
+          [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::craft-i18n.rev does not hold a commit"; exit 1; }
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+      - name: Check out craft-i18n
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-i18n
+          ref: ${{ steps.i18n.outputs.rev }}
+          path: craft-i18n
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -88,6 +104,8 @@ jobs:
         env:
           CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
           CRAFT_FONTS_REQUIRED: "1"
+          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
+          CRAFT_I18N_REQUIRED: "1"
         run: ./packaging/windows/package.ps1 -Arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -113,6 +131,22 @@ jobs:
           repository: storytold/craft-fonts
           ref: ${{ env.CRAFT_FONTS_REF }}
           path: craft-fonts
+      # The interface translations and the language data (hyphenation, spelling) are not in this repository:
+      # the build embeds them from storytold/craft-i18n at the commit in craft-i18n.rev, and without them
+      # the app is English only.
+      - id: i18n
+        name: Read the craft-i18n pin
+        shell: bash
+        run: |
+          rev=$(tr -d ' \t\r\n' < craft-i18n.rev)
+          [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::craft-i18n.rev does not hold a commit"; exit 1; }
+          echo "rev=$rev" >>"$GITHUB_OUTPUT"
+      - name: Check out craft-i18n
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-i18n
+          ref: ${{ steps.i18n.outputs.rev }}
+          path: craft-i18n
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -124,6 +158,8 @@ jobs:
         env:
           CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
           CRAFT_FONTS_REQUIRED: "1"
+          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
+          CRAFT_I18N_REQUIRED: "1"
         run: packaging/macos/package.sh --arch universal
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
